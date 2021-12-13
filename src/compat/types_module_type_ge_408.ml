@@ -9,3 +9,5 @@ let migrate_module_type : Types.module_type -> module_type_407 = function
   | Mty_signature s -> Mty_signature s
   | Mty_functor (i, mto, mt) -> Mty_functor (i, mto, mt)
   | Mty_alias p -> Mty_alias ((), p)
+
+let migrate_type_kind : Types.type_kind -> Types.type_kind = fun x -> x
