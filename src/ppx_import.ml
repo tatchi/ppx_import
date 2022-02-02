@@ -528,62 +528,83 @@ let type_declaration_rule =
 let module_declaration_rule =
   Ppxlib.Context_free.Rule.extension module_declaration_extension
 
-let module_type_new ~tool_name ~input_name ~loc (lid : Longident.t) =
+let module_type_new ~tool_name ~input_name
+    (modtype_decl : Ppxlib.module_type_declaration) =
   let open Ppxlib in
   (* let ({txt = lid; loc} as alias), subst = package_type in *)
-  if tool_name = "ocamldep" then
-    if is_self_reference ~input_name lid then
-      (* Create a dummy module type to break the circular dependency *)
-      Ast_helper.Mty.mk ~attrs:[] (Pmty_signature [])
-    else
-      (* Just put it as alias *)
-      Ast_helper.Mty.mk ~attrs:[] (Pmty_alias {txt = lid; loc})
-  else
-    Ppxlib.Ast_helper.with_default_loc loc (fun () ->
-        let env = Lazy.force lazy_env in
-        let tmodtype_decl =
-          match lid with
-          | Longident.Lapply _ ->
-            Location.raise_errorf ~loc
-              "[%%import] cannot import a functor application %s"
-              (string_of_lid lid)
-          | Longident.Lident _ as head_id ->
-            (* In this case, we know for sure that the user intends this lident
-               as a module type name, so we use Typetexp.find_type and
-               let the failure cases propagate to the user. *)
-            Compat.find_modtype env ~loc head_id |> snd
-          | Longident.Ldot (parent_id, elem) ->
-            let sig_items = locate_sig ~loc env parent_id in
-            get_modtype_decl ~loc sig_items parent_id elem
-        in
-        match tmodtype_decl with
-        | {mtd_type = Some (Mty_signature tsig); _} ->
-          (* let subst = List.map (fun ({txt; _}, typ) -> (`Lid txt, typ)) subst in *)
-          (* TODO: verify ? *)
-          let psig =
-            psig_of_tsig ~subst:[] (List.map Compat.migrate_signature_item tsig)
-          in
-          Ast_helper.Mty.mk ~attrs:[] (Pmty_signature psig)
-        | {mtd_type = None; _} ->
-          Location.raise_errorf ~loc "Imported module is abstract"
-        | _ ->
-          Location.raise_errorf ~loc "Imported module is indirectly defined" )
+  let {pmtd_type; pmtd_loc; _} = modtype_decl in
+  match pmtd_type with
+  | None ->
+    (* when there's nothing after the equal sign. Ex: module type Hashable *)
+    Location.raise_errorf ~loc:pmtd_loc "[%%import] module should have a type"
+  | Some modtype -> (
+    let {pmty_desc; _} = modtype in
+    match pmty_desc with
+    | Pmty_signature _ ->
+      (* Ex: module type Hashable = sig ... end *)
+      Location.raise_errorf ~loc:pmtd_loc
+        "[%%import] module shouldn't be defined inline"
+    | Pmty_with (_, _) ->
+      Location.raise_errorf ~loc:pmtd_loc
+        "[%%import] module doesn't work with 'with'"
+    | Pmty_functor (_, _) | Pmty_typeof _ | Pmty_extension _ | Pmty_alias _ ->
+      Location.raise_errorf ~loc:pmtd_loc "[%%import] not supported"
+    | Pmty_ident {txt = lid; loc} ->
+      if tool_name = "ocamldep" then
+        if is_self_reference ~input_name lid then
+          (* Create a dummy module type to break the circular dependency *)
+          Ast_helper.Mty.mk ~attrs:[] (Pmty_signature [])
+        else
+          (* Just put it as alias *)
+          Ast_helper.Mty.mk ~attrs:[] (Pmty_alias {txt = lid; loc})
+      else
+        Ppxlib.Ast_helper.with_default_loc loc (fun () ->
+            let env = Lazy.force lazy_env in
+            let tmodtype_decl =
+              match lid with
+              | Longident.Lapply _ ->
+                Location.raise_errorf ~loc
+                  "[%%import] cannot import a functor application %s"
+                  (string_of_lid lid)
+              | Longident.Lident _ as head_id ->
+                (* In this case, we know for sure that the user intends this lident
+                   as a module type name, so we use Typetexp.find_type and
+                   let the failure cases propagate to the user. *)
+                Compat.find_modtype env ~loc head_id |> snd
+              | Longident.Ldot (parent_id, elem) ->
+                let sig_items = locate_sig ~loc env parent_id in
+                get_modtype_decl ~loc sig_items parent_id elem
+            in
+            match tmodtype_decl with
+            | {mtd_type = Some (Mty_signature tsig); _} ->
+              (* let subst = List.map (fun ({txt; _}, typ) -> (`Lid txt, typ)) subst in *)
+              (* TODO: verify ? *)
+              let psig =
+                psig_of_tsig ~subst:[]
+                  (List.map Compat.migrate_signature_item tsig)
+              in
+              Ast_helper.Mty.mk ~attrs:[] (Pmty_signature psig)
+            | {mtd_type = None; _} ->
+              Location.raise_errorf ~loc "Imported module is abstract"
+            | _ ->
+              Location.raise_errorf ~loc "Imported module is indirectly defined" )
+    )
 
 let module_declaration_extension_new =
-  let mt_decl =
-    Ppxlib.Ast_pattern.(
-      module_type_declaration ~name:__ ~type_:(some (pmty_ident __)))
-  in
   Ppxlib.Extension.V3.declare "import" Ppxlib.Extension.Context.structure_item
     Ppxlib.Ast_pattern.(
-      psig (psig_modtype mt_decl ^:: nil) ||| pstr (pstr_modtype mt_decl ^:: nil))
-    (fun ~ctxt label lid ->
+      psig (psig_modtype __ ^:: nil) ||| pstr (pstr_modtype __ ^:: nil))
+    (fun ~ctxt modtype_decl ->
       let loc = Ppxlib.Expansion_context.Extension.extension_point_loc ctxt in
       let tool_name = Ppxlib.Expansion_context.Extension.tool_name ctxt in
       let input_name = Ppxlib.Expansion_context.Extension.input_name ctxt in
-      let mtype = module_type_new ~tool_name ~input_name ~loc lid in
-      let md_decl = Ppxlib.Ast_helper.Mtd.mk {txt = label; loc} ~typ:mtype in
-      Ppxlib.Ast_helper.Str.modtype md_decl )
+      let modtype = module_type_new ~tool_name ~input_name modtype_decl in
+      let Ppxlib.{pmtd_name; pmtd_attributes; pmtd_loc; _} = modtype_decl in
+      let md_decl =
+        Ppxlib.Ast_helper.Mtd.mk ~loc:pmtd_loc ~attrs:pmtd_attributes pmtd_name
+          ~typ:modtype
+      in
+      {pstr_desc = Pstr_modtype md_decl; pstr_loc = loc} )
 
 let module_declaration_rule_new =
   Ppxlib.Context_free.Rule.extension module_declaration_extension_new
