@@ -361,6 +361,59 @@ let is_self_reference ~input_name lid =
     fn = mn
   | _ -> false
 
+let type_declaration_new ~tool_name ~input_name
+    (type_decl : Ppxlib.type_declaration) =
+  let open Ppxlib in
+  match type_decl with
+  | { ptype_attributes
+    ; ptype_name
+    ; ptype_manifest =
+        Some ({ptyp_desc = Ptyp_constr ({txt = lid; loc}, _); _} as manifest)
+    ; _ } ->
+    if tool_name = "ocamldep" then
+      (* Just put it as manifest *)
+      if is_self_reference ~input_name lid then
+        {type_decl with ptype_manifest = None}
+      else {type_decl with ptype_manifest = Some manifest}
+    else
+      Ast_helper.with_default_loc loc (fun () ->
+          let ttype_decl =
+            let env = Lazy.force lazy_env in
+            match lid with
+            | Lapply _ ->
+              Location.raise_errorf ~loc
+                "[%%import] cannot import a functor application %s"
+                (string_of_lid lid)
+            | Lident _ as head_id ->
+              (* In this case, we know for sure that the user intends this lident
+                 as a type name, so we use Typetexp.find_type and let the failure
+                 cases propagate to the user. *)
+              Compat.find_type env ~loc head_id |> snd
+            | Ldot (parent_id, elem) ->
+              let sig_items = locate_sig ~loc env parent_id in
+              get_type_decl ~loc sig_items parent_id elem
+          in
+          let m, s =
+            if is_self_reference ~input_name lid then (None, [])
+            else
+              let subst = subst_of_manifest manifest in
+              let subst =
+                subst
+                @ [ ( `Lid (Lident (Longident.last_exn lid))
+                    , Ast_helper.Typ.constr
+                        {txt = Lident ptype_name.txt; loc = ptype_name.loc}
+                        [] ) ]
+              in
+              (Some manifest, subst)
+          in
+          let ptype_decl =
+            ptype_decl_of_ttype_decl ~manifest:m ~subst:s ptype_name ttype_decl
+          in
+          {ptype_decl with ptype_attributes} )
+  | _ ->
+    (* let () = print_endline "NOTHING TO DO IN NEW" in *)
+    type_decl
+
 let type_declaration ~tool_name ~input_name (type_decl : Ppxlib.type_declaration)
     =
   let open Ppxlib in
@@ -507,6 +560,7 @@ let module_type ~tool_name ~input_name (package_type : Ppxlib.package_type) =
 let type_declaration_expand ~ctxt type_decl =
   let tool_name = Ppxlib.Expansion_context.Extension.tool_name ctxt in
   let input_name = Ppxlib.Expansion_context.Extension.input_name ctxt in
+  (* let () = Ppxlib.Pprintast.type_declaration Format.std_formatter type_decl in *)
   type_declaration ~tool_name ~input_name type_decl
 
 let module_declaration_expand ~ctxt package_type =
@@ -590,29 +644,49 @@ let module_type_new ~tool_name ~input_name
               Location.raise_errorf ~loc "Imported module is indirectly defined" )
     )
 
-let module_declaration_extension_new =
+let type_declaration_extension_new =
   Ppxlib.Extension.V3.declare "import" Ppxlib.Extension.Context.structure_item
+    (*TODO: Check recursivity *)
     Ppxlib.Ast_pattern.(
-      psig (psig_modtype __ ^:: nil) ||| pstr (pstr_modtype __ ^:: nil))
-    (fun ~ctxt modtype_decl ->
+      psig (psig_type __ (__ ^:: nil) ^:: nil)
+      ||| pstr (pstr_type __ (__ ^:: nil) ^:: nil))
+    (fun ~ctxt rec_flag type_decl ->
       let loc = Ppxlib.Expansion_context.Extension.extension_point_loc ctxt in
       let tool_name = Ppxlib.Expansion_context.Extension.tool_name ctxt in
       let input_name = Ppxlib.Expansion_context.Extension.input_name ctxt in
-      let modtype = module_type_new ~tool_name ~input_name modtype_decl in
-      let Ppxlib.{pmtd_name; pmtd_attributes; pmtd_loc; _} = modtype_decl in
-      let md_decl =
-        Ppxlib.Ast_helper.Mtd.mk ~loc:pmtd_loc ~attrs:pmtd_attributes pmtd_name
-          ~typ:modtype
-      in
-      {pstr_desc = Pstr_modtype md_decl; pstr_loc = loc} )
+      let ttype_decl = type_declaration_new ~tool_name ~input_name type_decl in
+      (* let () =
+           Ppxlib.Pprintast.type_declaration Format.std_formatter ttype_decl
+         in *)
+      {pstr_desc = Pstr_type (rec_flag, [ttype_decl]); pstr_loc = loc} )
 
-let module_declaration_rule_new =
-  Ppxlib.Context_free.Rule.extension module_declaration_extension_new
+(* let module_declaration_extension_new =
+   Ppxlib.Extension.V3.declare "import" Ppxlib.Extension.Context.structure_item
+     Ppxlib.Ast_pattern.(
+       psig (psig_modtype __ ^:: nil) ||| pstr (pstr_modtype __ ^:: nil))
+     (fun ~ctxt modtype_decl ->
+       let loc = Ppxlib.Expansion_context.Extension.extension_point_loc ctxt in
+       let tool_name = Ppxlib.Expansion_context.Extension.tool_name ctxt in
+       let input_name = Ppxlib.Expansion_context.Extension.input_name ctxt in
+       let modtype = module_type_new ~tool_name ~input_name modtype_decl in
+       let Ppxlib.{pmtd_name; pmtd_attributes; pmtd_loc; _} = modtype_decl in
+       let md_decl =
+         Ppxlib.Ast_helper.Mtd.mk ~loc:pmtd_loc ~attrs:pmtd_attributes pmtd_name
+           ~typ:modtype
+       in
+       {pstr_desc = Pstr_modtype md_decl; pstr_loc = loc} ) *)
+
+(* let module_declaration_rule_new =
+   Ppxlib.Context_free.Rule.extension module_declaration_extension_new *)
+
+let type_declaration_rule_new =
+  Ppxlib.Context_free.Rule.extension type_declaration_extension_new
 
 let () =
   Ppxlib.Driver.register_transformation
     ~rules:
       [ module_declaration_rule
       ; type_declaration_rule
-      ; module_declaration_rule_new ]
+      ; type_declaration_rule_new
+        (* ; module_declaration_rule_new *) ]
     "ppx_import"
