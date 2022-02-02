@@ -1,0 +1,34 @@
+(executable
+ (name standalone)
+ (modules standalone)
+ (libraries ppx_import ppxlib))
+
+; (library
+;  (modules play_self_import)
+;  (ocamlc_flags -dsource)
+;  (name play_self_import)
+;  (preprocess
+;   (staged_pps ppx_import))
+;  (libraries compiler-libs.common stuff))
+
+(library
+ (modules play)
+ (ocamlc_flags -dsource)
+ (name play)
+ (modes byte)
+ (preprocess
+  (staged_pps ppx_import))
+ (libraries compiler-libs.common stuff))
+
+; (rule
+;  (targets play.actual.ml)
+;  (deps
+;   (file testa.ml)
+;   (:pp standalone.exe)
+;   (:input play.ml))
+;  (action
+;   (run ./%{pp} --impl %{input} -o %{targets})))
+
+(library
+ (modules stuff)
+ (name stuff))
