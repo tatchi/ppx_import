@@ -292,7 +292,7 @@ let ptype_decl_of_ttype_decl ~manifest ~subst ptype_name
                  ; pcd_args = map_args cd.cd_args
                  ; pcd_res
                  ; pcd_loc = cd.cd_loc
-                 ; pcd_attributes = Tt.copy_attributes cd.cd_attributes } ) ))
+                 ; pcd_attributes = Tt.copy_attributes cd.cd_attributes } ) ) )
   and ptype_manifest =
     match ttype_decl.type_manifest with
     | Some typ -> Some (core_type_of_type_expr ~subst typ)
@@ -501,18 +501,84 @@ let module_type ~tool_name ~input_name (package_type : Ppxlib.package_type) =
         | _ ->
           Location.raise_errorf ~loc "Imported module is indirectly defined" )
 
+let module_type_new ~tool_name ~input_name
+    (modtype_decl : Ppxlib.module_type_declaration) =
+  let open Ppxlib in
+  (* let ({txt = lid; loc} as alias), subst = package_type in *)
+  let {pmtd_type; pmtd_loc; _} = modtype_decl in
+  match pmtd_type with
+  | None ->
+    (* when there's nothing after the equal sign. Ex: module type Hashable *)
+    Location.raise_errorf ~loc:pmtd_loc "[%%import] module should have a type"
+  | Some modtype -> (
+    let {pmty_desc; _} = modtype in
+    match pmty_desc with
+    | Pmty_signature _ ->
+      (* Ex: module type Hashable = sig ... end *)
+      Location.raise_errorf ~loc:pmtd_loc
+        "[%%import] module shouldn't be defined inline"
+    | Pmty_with (_, _) ->
+      Location.raise_errorf ~loc:pmtd_loc
+        "[%%import] module doesn't work with 'with'"
+    | Pmty_functor (_, _) | Pmty_typeof _ | Pmty_extension _ | Pmty_alias _ ->
+      Location.raise_errorf ~loc:pmtd_loc "[%%import] not supported"
+    | Pmty_ident {txt = lid; loc} ->
+      if tool_name = "ocamldep" then
+        if is_self_reference ~input_name lid then
+          (* Create a dummy module type to break the circular dependency *)
+          Ast_helper.Mty.mk ~attrs:[] (Pmty_signature [])
+        else
+          (* Just put it as alias *)
+          Ast_helper.Mty.mk ~attrs:[] (Pmty_alias {txt = lid; loc})
+      else
+        Ppxlib.Ast_helper.with_default_loc loc (fun () ->
+            let env = Lazy.force lazy_env in
+            let tmodtype_decl =
+              match lid with
+              | Longident.Lapply _ ->
+                Location.raise_errorf ~loc
+                  "[%%import] cannot import a functor application %s"
+                  (string_of_lid lid)
+              | Longident.Lident _ as head_id ->
+                (* In this case, we know for sure that the user intends this lident
+                   as a module type name, so we use Typetexp.find_type and
+                   let the failure cases propagate to the user. *)
+                Compat.find_modtype env ~loc head_id |> snd
+              | Longident.Ldot (parent_id, elem) ->
+                let sig_items = locate_sig ~loc env parent_id in
+                get_modtype_decl ~loc sig_items parent_id elem
+            in
+            match tmodtype_decl with
+            | {mtd_type = Some (Mty_signature tsig); _} ->
+              (* let subst = List.map (fun ({txt; _}, typ) -> (`Lid txt, typ)) subst in *)
+              (* TODO: verify ? *)
+              let psig =
+                psig_of_tsig ~subst:[]
+                  (List.map Compat.migrate_signature_item tsig)
+              in
+              Ast_helper.Mty.mk ~attrs:[] (Pmty_signature psig)
+            | {mtd_type = None; _} ->
+              Location.raise_errorf ~loc "Imported module is abstract"
+            | _ ->
+              Location.raise_errorf ~loc "Imported module is indirectly defined" )
+    )
+
 let type_declaration_expand ~ctxt rec_flag type_decls =
   let loc = Ppxlib.Expansion_context.Extension.extension_point_loc ctxt in
   let tool_name = Ppxlib.Expansion_context.Extension.tool_name ctxt in
   let input_name = Ppxlib.Expansion_context.Extension.input_name ctxt in
-  let type_decls = type_decls |> List.map (type_declaration ~tool_name ~input_name) in
+  let type_decls =
+    type_decls |> List.map (type_declaration ~tool_name ~input_name)
+  in
   Ppxlib.{pstr_desc = Pstr_type (rec_flag, type_decls); pstr_loc = loc}
 
 let type_declaration_expand_intf ~ctxt rec_flag type_decls =
   let loc = Ppxlib.Expansion_context.Extension.extension_point_loc ctxt in
   let tool_name = Ppxlib.Expansion_context.Extension.tool_name ctxt in
   let input_name = Ppxlib.Expansion_context.Extension.input_name ctxt in
-  let type_decls = type_decls |> List.map (type_declaration ~tool_name ~input_name) in
+  let type_decls =
+    type_decls |> List.map (type_declaration ~tool_name ~input_name)
+  in
   Ppxlib.{psig_desc = Psig_type (rec_flag, type_decls); psig_loc = loc}
 
 let module_declaration_expand ~ctxt package_type =
@@ -520,18 +586,37 @@ let module_declaration_expand ~ctxt package_type =
   let input_name = Ppxlib.Expansion_context.Extension.input_name ctxt in
   module_type ~tool_name ~input_name package_type
 
+let module_declaration_expand_new ~ctxt modtype_decl =
+  let loc = Ppxlib.Expansion_context.Extension.extension_point_loc ctxt in
+  let tool_name = Ppxlib.Expansion_context.Extension.tool_name ctxt in
+  let input_name = Ppxlib.Expansion_context.Extension.input_name ctxt in
+  let modtype = module_type_new ~tool_name ~input_name modtype_decl in
+  let Ppxlib.{pmtd_name; pmtd_attributes; pmtd_loc; _} = modtype_decl in
+  let md_decl =
+    Ppxlib.Ast_helper.Mtd.mk ~loc:pmtd_loc ~attrs:pmtd_attributes pmtd_name
+      ~typ:modtype
+  in
+  Ppxlib.{pstr_desc = Pstr_modtype md_decl; pstr_loc = loc}
+
 let type_declaration_extension =
   Ppxlib.Extension.V3.declare "import" Ppxlib.Extension.Context.structure_item
-    Ppxlib.Ast_pattern.(
-      psig (psig_type __ __ ^:: nil)
-      ||| pstr (pstr_type __ __ ^:: nil))
-    type_declaration_expand
+    Ppxlib.Ast_pattern.(__)
+    (fun ~ctxt payload ->
+      match payload with
+      | Parsetree.PStr [{pstr_desc = Pstr_type (rec_flag, type_decls); _}]
+       |Parsetree.PSig [{psig_desc = Psig_type (rec_flag, type_decls); _}] ->
+        type_declaration_expand ~ctxt rec_flag type_decls
+      | Parsetree.PStr [{pstr_desc = Pstr_modtype modtype_decl; _}] ->
+        module_declaration_expand_new ~ctxt modtype_decl
+      | Parsetree.PStr _ -> assert false
+      | Parsetree.PSig _ -> assert false
+      | Parsetree.PTyp _ -> assert false
+      | Parsetree.PPat (_, _) -> assert false )
 
 let type_declaration_extension_intf =
   Ppxlib.Extension.V3.declare "import" Ppxlib.Extension.Context.signature_item
     Ppxlib.Ast_pattern.(
-      psig (psig_type __ __ ^:: nil)
-      ||| pstr (pstr_type __ __ ^:: nil))
+      psig (psig_type __ __ ^:: nil) ||| pstr (pstr_type __ __ ^:: nil) )
     type_declaration_expand_intf
 
 let module_declaration_extension =
